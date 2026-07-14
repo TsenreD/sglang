@@ -189,13 +189,17 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
-    # Idle/None ranks are permissive (like can_cuda_graph): the all-gather
-    # min()-reduces this across DP ranks, so a prefill batch with idle ranks
-    # still resolves to True (idle ranks become a padded dummy extend).
+    # Idle/None ranks veto BCG (the all-gather min()-reduces this across DP
+    # ranks): the fabricated dummy extend an idle rank would run under the
+    # forced-MAX_LEN replay reads KV through a stale req_to_token row, and
+    # that run-to-run garbage propagates into real tokens' logits through
+    # the shared EP grouped GEMMs — temp-0 outputs become nondeterministic
+    # at capture sizes whose grouped-GEMM tiling is composition-sensitive.
+    # Sparse-DP prefill therefore falls back to eager until the dummy-extend
+    # path is made deterministic.
     can_run_breakable_cuda_graph = (
-        local_batch is None
-        or local_batch.forward_mode.is_idle()
-        or local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+        local_batch is not None
+        and local_batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
     ) and check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
